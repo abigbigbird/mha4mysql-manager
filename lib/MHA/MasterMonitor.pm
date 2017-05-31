@@ -51,6 +51,7 @@ my $g_skip_ssh_check;
 my $g_ignore_fail_on_start = 0;
 my $_master_node_version;
 my $_server_manager;
+my $_master_ping;
 my $RETRY = 100;
 my $_status_handler;
 my $log;
@@ -60,6 +61,8 @@ sub exit_by_signal {
   eval {
     MHA::NodeUtil::drop_file_if( $_status_handler->{status_file} )
       unless ($g_check_only);
+    $_server_manager->disconnect_all() if ($_server_manager);
+    $_master_ping->disconnect_if()     if ($_master_ping);
   };
   if ($@) {
     $log->error("Got Error: $@");
@@ -109,7 +112,6 @@ sub check_master_ssh_env($) {
   my $target = shift;
   $log->info(
     "Checking SSH publickey authentication settings on the current master..");
-  my $ssh_user_host = $target->{ssh_user} . '@' . $target->{ssh_host};
 
   my $ssh_reachable;
   if (
@@ -125,7 +127,7 @@ sub check_master_ssh_env($) {
   else {
     $ssh_reachable = 1;
   }
-  if ($ssh_reachable) {
+  if ( $ssh_reachable && !$target->{has_gtid} ) {
     $_master_node_version =
       MHA::ManagerUtil::get_node_version( $log, $target->{ssh_user},
       $target->{ssh_host}, $target->{ssh_ip}, $target->{ssh_port} );
@@ -140,21 +142,26 @@ sub check_master_ssh_env($) {
   return $ssh_reachable;
 }
 
-sub check_master_binlog($) {
+sub check_binlog($) {
   my $target = shift;
-  $log->info("Checking recovery script configurations on the current master..");
-  my $ssh_user_host = $target->{ssh_user} . '@' . $target->{ssh_host};
+  $log->info(
+    sprintf( "Checking recovery script configurations on %s..",
+      $target->get_hostinfo() )
+  );
+  my $ssh_user_host = $target->{ssh_user} . '@' . $target->{ssh_ip};
   my $command       = get_binlog_check_command($target);
   $log->info("  Executing command: $command ");
-  $log->info("  Connecting to $ssh_user_host($target->{ssh_host}).. ");
+  $log->info(
+    "  Connecting to $ssh_user_host($target->{ssh_host}:$target->{ssh_port}).. "
+  );
   my ( $high, $low ) =
     MHA::ManagerUtil::exec_ssh_cmd( $ssh_user_host, $target->{ssh_port},
     $command, $g_logfile );
   if ( $high ne '0' || $low ne '0' ) {
-    $log->error("Master setting check failed!");
+    $log->error("Binlog setting check failed!");
     return 1;
   }
-  $log->info("Master setting check done.");
+  $log->info("Binlog setting check done.");
   return 0;
 }
 
@@ -249,6 +256,21 @@ sub check_scripts($) {
   }
 }
 
+sub check_binlog_servers {
+  my $binlog_server_ref = shift;
+  my $log               = shift;
+  my @binlog_servers    = @$binlog_server_ref;
+  if ( $#binlog_servers >= 0 ) {
+    MHA::ServerManager::init_binlog_server( $binlog_server_ref, $log );
+    foreach my $server (@binlog_servers) {
+      if ( check_binlog($server) ) {
+        $log->error("Binlog server configuration failed.");
+        croak;
+      }
+    }
+  }
+}
+
 sub wait_until_master_is_unreachable() {
   my ( @servers_config, @servers, @dead_servers, @alive_servers, @alive_slaves,
     $current_master, $ret, $ssh_reachable );
@@ -261,11 +283,12 @@ sub wait_until_master_is_unreachable() {
       $log->error("Configuration file $g_config_file not found!");
       croak;
     }
-    @servers_config = new MHA::Config(
+    my ( $sc_ref, $binlog_server_ref ) = new MHA::Config(
       logger     => $log,
       globalfile => $g_global_config_file,
       file       => $g_config_file
     )->read_config();
+    @servers_config = @$sc_ref;
 
     if ( !$g_logfile && !$g_check_only && $servers_config[0]->{manager_log} ) {
       $g_logfile = $servers_config[0]->{manager_log};
@@ -320,10 +343,10 @@ sub wait_until_master_is_unreachable() {
 
     unless ($current_master) {
       if ($g_interactive) {
-        print "Master is not currently alive. Proceed? (yes/no): ";
+        print "Master is not currently alive. Proceed? (yes/NO): ";
         my $ret = <STDIN>;
         chomp($ret);
-        die "abort" if ( lc($ret) !~ /y/ );
+        die "abort" if ( lc($ret) !~ /^y/ );
       }
     }
     if (
@@ -344,17 +367,27 @@ sub wait_until_master_is_unreachable() {
     }
     $_server_manager->check_repl_priv();
 
-    MHA::SSHCheck::do_ssh_connection_check( \@alive_servers, $log,
-      $servers_config[0]->{log_level}, $g_workdir )
-      unless ($g_skip_ssh_check);
-    $log->info("Checking MHA Node version..");
-    foreach my $slave (@alive_slaves) {
-      MHA::ManagerUtil::check_node_version(
-        $log,             $slave->{ssh_user}, $slave->{ssh_host},
-        $slave->{ssh_ip}, $slave->{ssh_port}
-      );
+    if ( !$_server_manager->is_gtid_auto_pos_enabled() ) {
+      $log->info("GTID (with auto-pos) is not supported");
+      MHA::SSHCheck::do_ssh_connection_check( \@alive_servers, $log,
+        $servers_config[0]->{log_level}, $g_workdir )
+        unless ($g_skip_ssh_check);
+      $log->info("Checking MHA Node version..");
+      foreach my $slave (@alive_slaves) {
+        MHA::ManagerUtil::check_node_version(
+          $log,             $slave->{ssh_user}, $slave->{ssh_host},
+          $slave->{ssh_ip}, $slave->{ssh_port}
+        );
+      }
+      $log->info(" Version check ok.");
     }
-    $log->info(" Version check ok.");
+    else {
+      $log->info(
+"GTID (with auto-pos) is supported. Skipping all SSH and Node package checking."
+      );
+      check_binlog_servers( $binlog_server_ref, $log );
+    }
+
     unless ($current_master) {
       $log->info("Getting current master (maybe dead) info ..");
       $current_master = $_server_manager->get_orig_master();
@@ -369,7 +402,9 @@ sub wait_until_master_is_unreachable() {
     $_server_manager->validate_num_alive_servers( $current_master,
       $g_ignore_fail_on_start );
     if ( check_master_ssh_env($current_master) ) {
-      if ( check_master_binlog($current_master) ) {
+      if ( !$_server_manager->is_gtid_auto_pos_enabled()
+        && check_binlog($current_master) )
+      {
         $log->error("Master configuration failed.");
         croak;
       }
@@ -377,7 +412,7 @@ sub wait_until_master_is_unreachable() {
     $_status_handler->set_master_host( $current_master->{hostname} )
       unless ($g_check_only);
 
-    if ( check_slave_env() ) {
+    if ( !$_server_manager->is_gtid_auto_pos_enabled() && check_slave_env() ) {
       $log->error("Slave configuration failed.");
       croak;
     }
@@ -389,7 +424,7 @@ sub wait_until_master_is_unreachable() {
     $func_rc = 0;
   };
   if ($@) {
-    $log->error("Error happend on checking configurations. $@") if ($log);
+    $log->error("Error happened on checking configurations. $@") if ($log);
     undef $@;
     return $func_rc;
   }
@@ -397,10 +432,12 @@ sub wait_until_master_is_unreachable() {
 
   # master ping. This might take hours/days/months..
   $func_rc = 1;
-  my $master_ping;
   eval {
     my $ssh_check_command;
-    if ( $_master_node_version && $_master_node_version >= 0.53 ) {
+    if (!$_server_manager->is_gtid_auto_pos_enabled()
+      && $_master_node_version
+      && $_master_node_version >= 0.53 )
+    {
       $ssh_check_command = get_binlog_check_command( $current_master, 1 );
     }
     else {
@@ -408,7 +445,7 @@ sub wait_until_master_is_unreachable() {
     }
     $log->debug("SSH check command: $ssh_check_command");
 
-    $master_ping = new MHA::HealthCheck(
+    $_master_ping = new MHA::HealthCheck(
       user                   => $current_master->{user},
       password               => $current_master->{password},
       ip                     => $current_master->{ip},
@@ -429,14 +466,14 @@ sub wait_until_master_is_unreachable() {
     );
     $log->info(
       sprintf( "Set master ping interval %d seconds.",
-        $master_ping->get_ping_interval() )
+        $_master_ping->get_ping_interval() )
     );
     if ( $current_master->{secondary_check_script} ) {
-      $master_ping->set_secondary_check_script(
+      $_master_ping->set_secondary_check_script(
         $current_master->{secondary_check_script} );
       $log->info(
         sprintf( "Set secondary check script: %s",
-          $master_ping->get_secondary_check_script() )
+          $_master_ping->get_secondary_check_script() )
       );
     }
     else {
@@ -449,7 +486,7 @@ sub wait_until_master_is_unreachable() {
       sprintf( "Starting ping health check on %s..",
         $current_master->get_hostinfo() )
     );
-    ( $ret, $ssh_reachable ) = $master_ping->wait_until_unreachable();
+    ( $ret, $ssh_reachable ) = $_master_ping->wait_until_unreachable();
     if ( $ret eq '2' ) {
       $log->error(
 "Target master's advisory lock is already held by someone. Please check whether you monitor the same master from multiple monitoring processes."
@@ -512,7 +549,8 @@ sub wait_until_master_is_dead {
       file       => $g_config_file
     );
 
-    my @servers_config = $conf->read_config();
+    my ( $sc_ref, $binlog_server_ref ) = $conf->read_config();
+    my @servers_config = @$sc_ref;
     $_server_manager = new MHA::ServerManager( servers => \@servers_config );
     $_server_manager->set_logger($log);
     $log->debug(
@@ -563,6 +601,7 @@ sub wait_until_master_is_dead {
 
     $log->info("Master is down!");
     $log->info("Terminating monitoring script.");
+    $_server_manager->disconnect_all() if ($_server_manager);
     return $MHA::ManagerConst::MASTER_DEAD_RC;
   };
   if ($@) {

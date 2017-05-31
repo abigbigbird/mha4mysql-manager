@@ -28,17 +28,20 @@ use MHA::ManagerConst;
 use Carp qw(croak);
 use DBI;
 use Data::Dumper;
+use Log::Dispatch;
 
 use constant Status => "Status";
 use constant Errstr => "Errstr";
 
 #show master status output
-use constant File             => "File";
-use constant Position         => "Position";
-use constant Binlog_Do_DB     => "Binlog_Do_DB";
-use constant Binlog_Ignore_DB => "Binlog_Ignore_DB";
+use constant File              => "File";
+use constant Position          => "Position";
+use constant Binlog_Do_DB      => "Binlog_Do_DB";
+use constant Binlog_Ignore_DB  => "Binlog_Ignore_DB";
+use constant Executed_Gtid_Set => "Executed_Gtid_Set";
 
 #show slave status output
+use constant Slave_IO_State              => "Slave_IO_State";
 use constant Slave_SQL_Running           => "Slave_SQL_Running";
 use constant Slave_IO_Running            => "Slave_IO_Running";
 use constant Master_Log_File             => "Master_Log_File";
@@ -59,6 +62,8 @@ use constant Relay_Log_Pos               => "Relay_Log_Pos";
 use constant Seconds_Behind_Master       => "Seconds_Behind_Master";
 use constant Last_Errno                  => "Last_Errno";
 use constant Last_Error                  => "Last_Error";
+use constant Retrieved_Gtid_Set          => "Retrieved_Gtid_Set";
+use constant Auto_Position               => "Auto_Position";
 
 use constant Set_Long_Wait_Timeout_SQL => "SET wait_timeout=86400";
 use constant Show_One_Variable_SQL     => "SHOW GLOBAL VARIABLES LIKE ?";
@@ -66,6 +71,10 @@ use constant Change_Master_SQL =>
 "CHANGE MASTER TO MASTER_HOST='%s', MASTER_PORT=%d, MASTER_USER='%s', MASTER_PASSWORD='%s', MASTER_LOG_FILE='%s', MASTER_LOG_POS=%d";
 use constant Change_Master_NoPass_SQL =>
 "CHANGE MASTER TO MASTER_HOST='%s', MASTER_PORT=%d, MASTER_USER='%s', MASTER_LOG_FILE='%s', MASTER_LOG_POS=%d";
+use constant Change_Master_Gtid_SQL =>
+"CHANGE MASTER TO MASTER_HOST='%s', MASTER_PORT=%d, MASTER_USER='%s', MASTER_PASSWORD='%s', MASTER_AUTO_POSITION=1";
+use constant Change_Master_Gtid_NoPass_SQL =>
+"CHANGE MASTER TO MASTER_HOST='%s', MASTER_PORT=%d, MASTER_USER='%s', MASTER_AUTO_POSITION=1";
 use constant Reset_Slave_Master_Host_SQL => "RESET SLAVE /*!50516 ALL */";
 use constant Reset_Slave_SQL             => "RESET SLAVE";
 use constant Change_Master_Clear_SQL     => "CHANGE MASTER TO MASTER_HOST=''";
@@ -83,12 +92,15 @@ use constant Start_SQL_Thread_SQL   => "START SLAVE SQL_THREAD";
 use constant Stop_SQL_Thread_SQL    => "STOP SLAVE SQL_THREAD";
 use constant Get_Basedir_SQL        => "SELECT \@\@global.basedir AS Value";
 use constant Get_Datadir_SQL        => "SELECT \@\@global.datadir AS Value";
+use constant Get_Num_Workers_SQL =>
+  "SELECT \@\@global.slave_parallel_workers AS Value";
 use constant Get_MaxAllowedPacket_SQL =>
   "SELECT \@\@global.max_allowed_packet AS Value";
 use constant Set_MaxAllowedPacket1G_SQL =>
   "SET GLOBAL max_allowed_packet=1*1024*1024*1024";
 use constant Set_MaxAllowedPacket_SQL => "SET GLOBAL max_allowed_packet=%d";
 use constant Is_Readonly_SQL          => "SELECT \@\@global.read_only As Value";
+use constant Has_Gtid_SQL             => "SELECT \@\@global.gtid_mode As Value";
 use constant Get_ServerID_SQL         => "SELECT \@\@global.server_id As Value";
 use constant Unset_Readonly_SQL       => "SET GLOBAL read_only=0";
 use constant Set_Readonly_SQL         => "SET GLOBAL read_only=1";
@@ -97,12 +109,22 @@ use constant Set_Log_Bin_Local_SQL    => "SET sql_log_bin=1";
 use constant Rename_User_SQL          => "RENAME USER '%s'\@'%%' TO '%s'\@'%%'";
 use constant Master_Pos_Wait_NoTimeout_SQL =>
   "SELECT MASTER_POS_WAIT(?,?,0) AS Result";
+use constant Gtid_Wait_NoTimeout_SQL =>
+  "SELECT WAIT_UNTIL_SQL_THREAD_AFTER_GTIDS(?,0) AS Result";
 use constant Get_Connection_Id_SQL  => "SELECT CONNECTION_ID() AS Value";
 use constant Flush_Tables_Nolog_SQL => "FLUSH NO_WRITE_TO_BINLOG TABLES";
 use constant Flush_Tables_With_Read_Lock_SQL => "FLUSH TABLES WITH READ LOCK";
 use constant Unlock_Tables_SQL               => "UNLOCK TABLES";
 use constant Repl_User_SQL =>
   "SELECT Repl_slave_priv AS Value FROM mysql.user WHERE user = ?";
+use constant Select_User_Regexp_SQL =>
+"SELECT user, host, password FROM mysql.user WHERE user REGEXP ? AND host REGEXP ?";
+use constant Set_Password_SQL             => "SET PASSWORD FOR ?\@? = ?";
+use constant Old_Password_Length          => 16;
+use constant Blocked_Empty_Password       => '?' x 41;
+use constant Blocked_Old_Password_Head    => '~' x 25;
+use constant Blocked_New_Password_Regexp  => qr/^[0-9a-fA-F]{40}\*$/o;
+use constant Released_New_Password_Regexp => qr/^\*[0-9a-fA-F]{40}$/o;
 
 sub new {
   my $class = shift;
@@ -110,6 +132,8 @@ sub new {
     dsn           => undef,
     dbh           => undef,
     connection_id => undef,
+    has_gtid      => undef,
+    is_mariadb    => undef,
     @_,
   };
   return bless $self, $class;
@@ -128,7 +152,7 @@ sub connect_util {
   my $port     = shift;
   my $user     = shift;
   my $password = shift;
-  my $dsn      = "DBI:mysql:;host=$host;port=$port;mysql_connect_timeout=1";
+  my $dsn      = "DBI:mysql:;host=[$host];port=$port;mysql_connect_timeout=1";
   my $dbh      = DBI->connect( $dsn, $user, $password, { PrintError => 0 } );
   return $dbh;
 }
@@ -140,6 +164,7 @@ sub check_connection_fast_util {
   my $password = shift;
   my $dbh      = connect_util( $host, $port, $user, $password );
   if ( defined($dbh) ) {
+    $dbh->disconnect();
     return "1:Connection Succeeded";
   }
   else {
@@ -170,7 +195,7 @@ sub connect {
 
   $self->{dbh} = undef;
   unless ( $self->{dsn} ) {
-    $self->{dsn} = "DBI:mysql:;host=$host;port=$port;mysql_connect_timeout=4";
+    $self->{dsn} = "DBI:mysql:;host=[$host];port=$port;mysql_connect_timeout=4";
   }
   my $defaults = {
     PrintError => 0,
@@ -243,6 +268,16 @@ sub is_read_only($) {
   return $self->get_variable(Is_Readonly_SQL);
 }
 
+sub has_gtid($) {
+  my $self  = shift;
+  my $value = $self->get_variable(Has_Gtid_SQL);
+  if ( defined($value) && $value eq "ON" ) {
+    $self->{has_gtid} = 1;
+    return 1;
+  }
+  return 0;
+}
+
 sub get_basedir($) {
   my $self = shift;
   return $self->get_variable(Get_Basedir_SQL);
@@ -253,9 +288,18 @@ sub get_datadir($) {
   return $self->get_variable(Get_Datadir_SQL);
 }
 
-sub get_version($) {
+sub get_num_workers($) {
   my $self = shift;
-  return MHA::SlaveUtil::get_version( $self->{dbh} );
+  return $self->get_variable(Get_Num_Workers_SQL);
+}
+
+sub get_version($) {
+  my $self  = shift;
+  my $value = MHA::SlaveUtil::get_version( $self->{dbh} );
+  if ( $value =~ /MariaDB/ ) {
+    $self->{is_mariadb} = 1;
+  }
+  return $value;
 }
 
 sub is_relay_log_purge($) {
@@ -312,15 +356,16 @@ sub show_master_status($) {
   return if ( !defined($ret) || $ret != 1 );
 
   $href = $sth->fetchrow_hashref;
-  for my $key ( File, Position ) {
+  for my $key ( File, Position, Executed_Gtid_Set ) {
     $values{$key} = $href->{$key};
   }
   for my $filter_key ( Binlog_Do_DB, Binlog_Ignore_DB ) {
     $values{$filter_key} = uniq_and_sort( $href->{$filter_key} );
   }
   return (
-    $values{File},         $values{Position},
-    $values{Binlog_Do_DB}, $values{Binlog_Ignore_DB}
+    $values{File}, $values{Position}, $values{Binlog_Do_DB},
+    $values{Binlog_Ignore_DB},
+    $values{Executed_Gtid_Set}
   );
 
 }
@@ -417,6 +462,24 @@ sub change_master($$$$$$$) {
       $master_host,     $master_port, $master_user,
       $master_log_file, $master_log_pos
     );
+  }
+  return $self->execute($query);
+}
+
+sub change_master_gtid($$$$$) {
+  my $self            = shift;
+  my $master_host     = shift;
+  my $master_port     = shift;
+  my $master_user     = shift;
+  my $master_password = shift;
+  my $query;
+  if ($master_password) {
+    $query = sprintf( Change_Master_Gtid_SQL,
+      $master_host, $master_port, $master_user, $master_password );
+  }
+  else {
+    $query = sprintf( Change_Master_Gtid_NoPass_SQL,
+      $master_host, $master_port, $master_user );
   }
   return $self->execute($query);
 }
@@ -530,19 +593,23 @@ sub check_slave_status {
   $href = $sth->fetchrow_hashref;
 
   for my $key (
-    Master_Host,         Master_Port,
-    Master_User,         Slave_IO_Running,
-    Slave_SQL_Running,   Master_Log_File,
-    Read_Master_Log_Pos, Relay_Master_Log_File,
-    Last_Errno,          Last_Error,
-    Exec_Master_Log_Pos, Relay_Log_File,
-    Relay_Log_Pos,       Seconds_Behind_Master
+    Slave_IO_State,        Master_Host,
+    Master_Port,           Master_User,
+    Slave_IO_Running,      Slave_SQL_Running,
+    Master_Log_File,       Read_Master_Log_Pos,
+    Relay_Master_Log_File, Last_Errno,
+    Last_Error,            Exec_Master_Log_Pos,
+    Relay_Log_File,        Relay_Log_Pos,
+    Seconds_Behind_Master, Retrieved_Gtid_Set,
+    Executed_Gtid_Set,     Auto_Position
     )
   {
     $status{$key} = $href->{$key};
   }
 
-  if ( !$status{Master_Host} || !$status{Master_Log_File} ) {
+  if ( !$status{Master_Host}
+    || !$status{Master_Log_File} )
+  {
     unless ($allow_dummy) {
 
       # I am not a slave
@@ -561,24 +628,40 @@ sub check_slave_status {
   return %status;
 }
 
-# wait until slave executes all relay logs.
-# MASTER_LOG_POS() must not be used
-sub wait_until_relay_log_applied($) {
-  my $self = shift;
-  return read_all_relay_log( $self, 1 );
+sub wait_until_relay_io_log_applied($$$) {
+  my $self               = shift;
+  my $log                = shift;
+  my $num_worker_threads = shift;
+  return read_all_relay_log( $self, $log, $num_worker_threads, 1, 1 );
 }
 
-sub read_all_relay_log($$) {
-  my $self              = shift;
-  my $wait_until_latest = shift;
-  $wait_until_latest = 0 if ( !defined($wait_until_latest) );
+# wait until slave executes all relay logs.
+# MASTER_LOG_POS() must not be used
+sub wait_until_relay_log_applied($$$) {
+  my $self               = shift;
+  my $log                = shift;
+  my $num_worker_threads = shift;
+  return read_all_relay_log( $self, $log, $num_worker_threads, 1 );
+}
+
+sub read_all_relay_log {
+  my $self                 = shift;
+  my $log                  = shift;
+  my $num_worker_threads   = shift;
+  my $wait_until_latest    = shift;
+  my $io_thread_should_run = shift;
+  $wait_until_latest    = 0 if ( !defined($wait_until_latest) );
+  $io_thread_should_run = 0 if ( !defined($io_thread_should_run) );
+  my $sql_thread_check;
+
   my %status;
   do {
-    %status = $self->check_slave_status();
+    $sql_thread_check = 1;
+    %status           = $self->check_slave_status();
     if ( $status{Status} != 0 ) {
       return %status;
     }
-    elsif ( $status{Slave_IO_Running} eq "Yes" ) {
+    elsif ( !$io_thread_should_run && $status{Slave_IO_Running} eq "Yes" ) {
       $status{Status} = 3;
       $status{Errstr} = "Slave IO thread is running! Check master status.";
       return %status;
@@ -595,22 +678,58 @@ sub read_all_relay_log($$) {
       return %status;
     }
 
-    my $sth = $self->{dbh}->prepare(Show_Processlist_SQL);
-    $sth->execute();
-    while ( my $ref = $sth->fetchrow_hashref ) {
-      my $user  = $ref->{User};
-      my $state = $ref->{State};
-      if (
-           defined($user)
-        && $user eq "system user"
-        && defined($state)
-        && ( $state =~ m/^Has read all relay log/
-          || $state =~ m/^Slave has read all relay log/ )
-        )
+    if ($io_thread_should_run) {
+      if (!$status{Slave_IO_State}
+        || $status{Slave_IO_State} !~ m/Waiting for master to send event/ )
       {
+        $sql_thread_check = 0;
+      }
+    }
+    if ($sql_thread_check) {
+      my $sql_thread_done    = 0;
+      my $worker_thread_done = 0;
+      my $current_workers    = 0;
+      my $sth                = $self->{dbh}->prepare(Show_Processlist_SQL);
+      $sth->execute();
+      while ( my $ref = $sth->fetchrow_hashref ) {
+        my $user  = $ref->{User};
+        my $state = $ref->{State};
+        if ( defined($user)
+          && $user eq "system user"
+          && defined($state) )
+        {
+          if ( $state =~ m/^Has read all relay log/
+            || $state =~ m/^Slave has read all relay log/ )
+          {
+            $sql_thread_done = 1;
+            if ( $num_worker_threads == 0 ) {
+              $worker_thread_done = 1;
+            }
+            if ($worker_thread_done) {
+              last;
+            }
+          }
+          elsif ( $state =~ m/^Waiting for an event from Coordinator/ ) {
+            $current_workers++;
+            if ( $current_workers >= $num_worker_threads ) {
+              $worker_thread_done = 1;
+            }
+          }
+        }
+        if ( $worker_thread_done == 1 && $sql_thread_done == 1 ) {
+          last;
+        }
+      }
+      if ( $sql_thread_done == 1 && $worker_thread_done == 1 ) {
         $status{Status} = 0;
         return %status;
       }
+      $log->debug(
+        sprintf(
+          "Sql Thread Done: %d, Worker Thread done: %d, Ended workers: %d",
+          $sql_thread_done, $worker_thread_done, $current_workers
+        )
+      );
     }
   } while ( $wait_until_latest && sleep(1) );
 
@@ -643,8 +762,9 @@ sub get_threads_util {
     $info =~ s/^\s*(.*?)\s*$/$1/ if defined($info);
     next if ( $my_connection_id == $id );
     next if ( defined($query_time) && $query_time < $running_time_threshold );
-    next if ( defined($command)    && $command eq "Binlog Dump" );
+    next if ( defined($command)    && $command =~ /^Binlog Dump/ );
     next if ( defined($user)       && $user eq "system user" );
+    next if ( defined($user)       && $user eq "event_scheduler" );
 
     if ( $type >= 1 ) {
       next if ( defined($command) && $command eq "Sleep" );
@@ -741,6 +861,79 @@ sub master_pos_wait($$$) {
   $sth->execute( $binlog_file, $binlog_pos );
   my $href = $sth->fetchrow_hashref;
   return $href->{Result};
+}
+
+sub gtid_wait($$) {
+  my $self      = shift;
+  my $exec_gtid = shift;
+  my $sth       = $self->{dbh}->prepare(Gtid_Wait_NoTimeout_SQL);
+  $sth->execute($exec_gtid);
+  my $href = $sth->fetchrow_hashref;
+  return $href->{Result};
+}
+
+sub _blocked_password {
+  my $password = shift;
+  if ( $password eq '' ) {
+    return Blocked_Empty_Password;
+  }
+  elsif ( length($password) == Old_Password_Length ) {
+    return Blocked_Old_Password_Head . $password;
+  }
+  elsif ( $password =~ Released_New_Password_Regexp ) {
+    return join( "", reverse( split //, $password ) );
+  }
+  else {
+    return;
+  }
+}
+
+sub _released_password {
+  my $password = shift;
+  if ( $password eq Blocked_Empty_Password ) {
+    return '';
+  }
+  elsif ( index( $password, Blocked_Old_Password_Head ) == 0 ) {
+    return substr( $password, length(Blocked_Old_Password_Head) );
+  }
+  elsif ( $password =~ Blocked_New_Password_Regexp ) {
+    return join( "", reverse( split //, $password ) );
+  }
+  else {
+    return;
+  }
+}
+
+sub _block_release_user_by_regexp {
+  my ( $dbh, $user, $host, $block ) = @_;
+  my $users_to_block =
+    $dbh->selectall_arrayref( Select_User_Regexp_SQL, { Slice => {} },
+    $user, $host );
+  my $failure = 0;
+  for my $u ( @{$users_to_block} ) {
+    my $password =
+      $block
+      ? _blocked_password( $u->{password} )
+      : _released_password( $u->{password} );
+    if ( defined $password ) {
+      my $ret =
+        $dbh->do( Set_Password_SQL, undef, $u->{user}, $u->{host}, $password );
+      unless ( $ret eq "0E0" ) {
+        $failure++;
+      }
+    }
+  }
+  return $failure;
+}
+
+sub block_user_regexp {
+  my ( $self, $user, $host ) = @_;
+  return _block_release_user_by_regexp( $self->{dbh}, $user, $host, 1 );
+}
+
+sub release_user_regexp {
+  my ( $self, $user, $host ) = @_;
+  return _block_release_user_by_regexp( $self->{dbh}, $user, $host, 0 );
 }
 
 1;

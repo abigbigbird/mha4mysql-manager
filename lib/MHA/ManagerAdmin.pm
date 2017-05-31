@@ -132,7 +132,7 @@ sub check_status_file_pid($) {
       return $MHA::ManagerConst::ST_RUNNING;
     }
   }
-  croak "Got unknwon status: $status_string\n";
+  croak "Got unknown status: $status_string\n";
 }
 
 sub read_conf($) {
@@ -147,7 +147,8 @@ sub read_conf($) {
     globalfile => $self->{global_conf},
     file       => $self->{conf},
   );
-  my @sc = $conf->read_config();
+  my ( $sc_ref, undef ) = $conf->read_config();
+  my @sc = @$sc_ref;
   $self->{status_dir} = $sc[0]->{manager_workdir}
     unless ( $self->{status_dir} );
   $self->{logfile} = $sc[0]->{manager_log};
@@ -163,7 +164,7 @@ sub init {
   unless ( $self->{status_dir} ) {
     if ( $self->{conf} ) {
       croak
-"Failed to get status file directory(set in workdir parameter) from $self->{conf}.\n";
+"Failed to get status file directory (set in workdir parameter) from $self->{conf}.\n";
     }
     else {
       croak "Either --conf or --status_dir must be set.\n";
@@ -207,15 +208,10 @@ sub stop_manager {
 "MHA Manager is not running on $self->{app}($MHA::ManagerConst::ST_NOT_RUNNING_S).\n";
       return 0;
     }
-    elsif ( $ret == $MHA::ManagerConst::ST_NOT_FOUND ) {
-      print
-"MHA Manager is not running on $self->{app}($MHA::ManagerConst::ST_NOT_FOUND_S).\n";
-      return 0;
-    }
     elsif ( $ret == $MHA::ManagerConst::ST_FAILOVER_RUNNING
       && !$self->{abort} )
     {
-      print "Currently Failover is running on $self->{app}. Shoud not stop.\n";
+      print "Currently Failover is running on $self->{app}. Should not stop.\n";
       return 1;
     }
     else {
@@ -282,9 +278,6 @@ sub check_status {
       }
       print
 " ($MHA::ManagerConst::ST_PARTIALLY_RUNNING_S). Check ps output for details and kill it.\n";
-    }
-    elsif ( $ret == $MHA::ManagerConst::ST_NOT_FOUND ) {
-      print "$app is stopped($MHA::ManagerConst::ST_NOT_FOUND_S).\n";
     }
     elsif ( $ret == $MHA::ManagerConst::ST_INITIALIZING_MONITOR ) {
       print

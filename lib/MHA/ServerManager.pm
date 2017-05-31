@@ -195,6 +195,52 @@ sub init_servers($) {
   }
 }
 
+sub init_binlog_server {
+  my $binlog_server_ref        = shift;
+  my $log                      = shift;
+  my @binlog_servers           = @$binlog_server_ref;
+  my $num_alive_binlog_servers = 0;
+  foreach my $server (@binlog_servers) {
+    unless ( $server->{logger} ) {
+      $server->{logger} = $log;
+    }
+    if (
+      MHA::HealthCheck::ssh_check_simple(
+        $server->{ssh_user}, $server->{ssh_host},
+        $server->{ssh_ip},   $server->{ssh_port},
+        $server->{logger},   $server->{ssh_connection_timeout}
+      )
+      )
+    {
+      $log->warning("Failed to SSH to binlog server $server->{hostname}");
+      $server->{ssh_reachable} = 0;
+    }
+    else {
+      if (
+        MHA::ManagerUtil::get_node_version(
+          $server->{logger}, $server->{ssh_user}, $server->{ssh_host},
+          $server->{ssh_ip}, $server->{ssh_port}
+        )
+        )
+      {
+        $log->info("Binlog server $server->{hostname} is reachable.");
+        $server->{ssh_reachable} = 1;
+        $num_alive_binlog_servers++;
+      }
+      else {
+        $log->warning(
+"Failed to get MHA Node version from binlog server $server->{hostname}"
+        );
+        $server->{ssh_reachable} = 0;
+      }
+    }
+  }
+  if ( $#binlog_servers >= 0 && $num_alive_binlog_servers <= 0 ) {
+    $log->error("Binlog Server is defined but there is no alive server.");
+    croak;
+  }
+}
+
 sub set_logger($$) {
   my $self   = shift;
   my $logger = shift;
@@ -248,7 +294,7 @@ sub connect_all_and_read_server_status($$$$) {
           $connection_checker->finish($MHA::ManagerConst::MYSQL_DEAD_RC);
         }
       }
-      my $rc = $target->connect_check(2);
+      my $rc = $target->connect_check( 2, $log, 1 );
       $connection_checker->finish($rc);
     };
     if ($@) {
@@ -272,6 +318,9 @@ sub connect_all_and_read_server_status($$$$) {
   $self->compare_slave_version();
   $log->debug("Connecting to servers done.");
   $self->validate_current_master();
+  $self->{gtid_failover_mode} = $self->get_gtid_status();
+  $log->info(
+    sprintf( "GTID failover mode = %d", $self->{gtid_failover_mode} ) );
 }
 
 sub get_oldest_version($) {
@@ -480,7 +529,7 @@ sub validate_slaves($$$) {
         sprintf( " read_only=1 is not set on slave %s.\n", $_->get_hostinfo() )
       );
     }
-    if ( $_->{relay_purge} ne '0' ) {
+    if ( $_->{relay_purge} ne '0' && !$_->{has_gtid} ) {
       $log->warning(
         sprintf( " relay_log_purge=0 is not set on slave %s.\n",
           $_->get_hostinfo() )
@@ -489,7 +538,7 @@ sub validate_slaves($$$) {
     if ( $_->{log_bin} eq '0' ) {
       $log->warning(
         sprintf(
-          " log-bin is not set on slave %s. This host can not be a master.\n",
+          " log-bin is not set on slave %s. This host cannot be a master.\n",
           $_->get_hostinfo() )
       );
     }
@@ -896,6 +945,8 @@ sub read_slave_status($) {
     $_->{Exec_Master_Log_Pos}   = $status{Exec_Master_Log_Pos};
     $_->{Relay_Log_File}        = $status{Relay_Log_File};
     $_->{Relay_Log_Pos}         = $status{Relay_Log_Pos};
+    $_->{Retrieved_Gtid_Set}    = $status{Retrieved_Gtid_Set};
+    $_->{Executed_Gtid_Set}     = $status{Executed_Gtid_Set};
   }
   $log->debug(" Fetching current slave status done.");
 }
@@ -977,6 +1028,10 @@ sub identify_latest_slaves($$) {
       $latest[0]{Read_Master_Log_Pos}
     )
   );
+  if ( $latest[0]{Retrieved_Gtid_Set} ) {
+    $log->info(
+      sprintf( "Retrieved Gtid Set: %s", $latest[0]{Retrieved_Gtid_Set} ) );
+  }
   if ($find_oldest) {
     $self->set_oldest_slaves( \@latest );
   }
@@ -1034,6 +1089,24 @@ sub get_oldest_limit_pos($) {
   }
   return ( $target->{Master_Log_File}, $target->{Read_Master_Log_Pos} )
     if ($target);
+}
+
+sub get_most_advanced_latest_slave($) {
+  my $self   = shift;
+  my @latest = $self->get_latest_slaves();
+  my $target;
+  foreach my $slave (@latest) {
+    $target = $slave unless ($target);
+    if (
+      $slave->{Relay_Master_Log_File} gt $target->{Relay_Master_Log_File}
+      || ( $slave->{Relay_Master_Log_File} eq $target->{Relay_Master_Log_File}
+        && $slave->{Exec_Master_Log_Pos} > $target->{Exec_Master_Log_Pos} )
+      )
+    {
+      $target = $slave;
+    }
+  }
+  return $target;
 }
 
 # check slave is too behind master or not
@@ -1212,27 +1285,42 @@ sub get_new_master_binlog_position($$) {
   my $dbhelper = $target->{dbhelper};
   my $log      = $self->{logger};
   $log->info("Getting new master's binlog name and position..");
-  my ( $file, $pos ) = $dbhelper->show_master_status();
+  my ( $file, $pos, $a, $b, $gtid ) = $dbhelper->show_master_status();
   if ( $file && defined($pos) ) {
     $log->info(" $file:$pos");
-    $log->info(
-      sprintf(
+    if ( $self->is_gtid_auto_pos_enabled() ) {
+      $log->info(
+        sprintf(
+" All other slaves should start replication from here. Statement should be: CHANGE MASTER TO MASTER_HOST='%s', MASTER_PORT=%d, MASTER_AUTO_POSITION=1, MASTER_USER='%s', MASTER_PASSWORD='xxx';",
+          ( $target->{hostname} eq $target->{ip} )
+          ? $target->{hostname}
+          : ("$target->{hostname} or $target->{ip}"),
+          $target->{port},
+          $target->{repl_user}
+        )
+      );
+
+    }
+    else {
+      $log->info(
+        sprintf(
 " All other slaves should start replication from here. Statement should be: CHANGE MASTER TO MASTER_HOST='%s', MASTER_PORT=%d, MASTER_LOG_FILE='%s', MASTER_LOG_POS=%d, MASTER_USER='%s', MASTER_PASSWORD='xxx';",
-        ( $target->{hostname} eq $target->{ip} )
-        ? $target->{hostname}
-        : ("$target->{hostname} or $target->{ip}"),
-        $target->{port},
-        $file,
-        $pos,
-        $target->{repl_user}
-      )
-    );
+          ( $target->{hostname} eq $target->{ip} )
+          ? $target->{hostname}
+          : ("$target->{hostname} or $target->{ip}"),
+          $target->{port},
+          $file,
+          $pos,
+          $target->{repl_user}
+        )
+      );
+    }
   }
   else {
     $log->error("Getting new master's binlog position failed!");
     return;
   }
-  return ( $file, $pos );
+  return ( $file, $pos, $gtid );
 }
 
 sub change_master_and_start_slave {
@@ -1249,17 +1337,28 @@ sub change_master_and_start_slave {
   );
   $target->stop_slave($log) unless ( $target->{not_slave} );
   $dbhelper->reset_slave()  unless ( $target->{not_slave} );
-  $dbhelper->change_master( $target->{use_ip_for_change_master}
+  my $addr =
+      $target->{use_ip_for_change_master}
     ? $master->{ip}
-    : $master->{hostname},
-    $master->{port}, $master_log_file, $master_log_pos, $master->{repl_user},
-    $master->{repl_password} );
+    : $master->{hostname};
+
+  if ( $self->is_gtid_auto_pos_enabled() && !$target->{is_mariadb} ) {
+    $dbhelper->change_master_gtid( $addr, $master->{port},
+      $master->{repl_user}, $master->{repl_password} );
+  }
+  else {
+    $dbhelper->change_master( $addr,
+      $master->{port}, $master_log_file, $master_log_pos, $master->{repl_user},
+      $master->{repl_password} );
+  }
   $log->info(" Executed CHANGE MASTER.");
 
   # After executing CHANGE MASTER, relay_log_purge is automatically disabled.
   # If the original value is 0, we should turn to 0 explicitly.
-  unless ( $target->{relay_purge} ) {
-    $target->disable_relay_log_purge();
+  if ( !$target->{has_gtid} ) {
+    unless ( $target->{relay_purge} ) {
+      $target->disable_relay_log_purge();
+    }
   }
   my $ret = $target->start_slave($log);
   unless ($ret) {
@@ -1290,12 +1389,10 @@ sub stop_io_threads {
   my $self         = shift;
   my $log          = $self->{logger};
   my @alive_slaves = $self->get_alive_slaves();
-  my $pm           = new Parallel::ForkManager( $#alive_slaves + 1 );
   foreach my $target (@alive_slaves) {
     $target->stop_io_thread($target);
     exit 0;
   }
-  $pm->wait_all_children;
   return 0;
 }
 
@@ -1320,12 +1417,12 @@ sub get_current_servers_ascii {
   my $orig_master  = shift;
   my @alive_slaves = $self->get_alive_slaves();
 
-  my $str = "$orig_master->{hostname} (current master)";
+  my $str = $orig_master->get_hostinfo() . " (current master)";
   $str .= " ($orig_master->{node_label})"
     if ( $orig_master->{node_label} );
   $str .= "\n";
   foreach my $slave (@alive_slaves) {
-    $str .= " +--" . "$slave->{hostname}";
+    $str .= " +--" . $slave->get_hostinfo();
     $str .= " ($slave->{node_label})" if ( $slave->{node_label} );
     $str .= "\n";
   }
@@ -1357,18 +1454,18 @@ sub print_servers_migration_ascii {
   $str .= $self->get_current_servers_ascii($orig_master);
 
   $str .= "To:\n";
-  $str .= "$new_master->{hostname} (new master)";
+  $str .= $new_master->get_hostinfo() . " (new master)";
   $str .= " ($new_master->{node_label})"
     if ( $new_master->{node_label} );
   $str .= "\n";
   foreach my $slave (@alive_slaves) {
     next if ( $slave->{id} eq $new_master->{id} );
-    $str .= " +--" . "$slave->{hostname}";
+    $str .= " +--" . $slave->get_hostinfo();
     $str .= " ($slave->{node_label})" if ( $slave->{node_label} );
     $str .= "\n";
   }
   if ($orig_master_is_new_slave) {
-    $str .= " +--" . "$orig_master->{hostname}";
+    $str .= " +--" . $orig_master->get_hostinfo();
     $str .= " ($orig_master->{node_label})" if ( $orig_master->{node_label} );
     $str .= "\n";
   }
@@ -1433,6 +1530,58 @@ sub check_replication_health {
       $log->info(" ok.");
     }
   }
+}
+
+sub get_gtid_status($) {
+  my $self    = shift;
+  my @servers = $self->get_alive_servers();
+  my @slaves  = $self->get_alive_slaves();
+  return 0 if ( $#servers < 0 );
+  foreach (@servers) {
+    return 0 unless ( $_->{has_gtid} );
+  }
+  foreach (@slaves) {
+    return 0 unless ( $_->{Executed_Gtid_Set} );
+  }
+  foreach (@slaves) {
+    return 1
+      if ( defined( $_->{Auto_Position} )
+      && $_->{Auto_Position} == 1 );
+    return 1 if ( $_->{use_gtid_auto_pos} );
+  }
+  return 2;
+}
+
+sub is_gtid_auto_pos_enabled($) {
+  my $self = shift;
+  return 1 if ( $self->{gtid_failover_mode} == 1 );
+  return 0;
+}
+
+sub force_disable_log_bin_if_auto_pos_disabled($) {
+  my $self = shift;
+  my $log  = $self->{logger};
+  if ( $self->{gtid_failover_mode} == 2 ) {
+    my @slaves = $self->get_alive_slaves();
+    $log->info("Forcing disable_log_bin since GTID auto pos is disabled");
+    foreach my $slave (@slaves) {
+      $slave->{disable_log_bin} = 1;
+    }
+  }
+}
+
+sub wait_until_in_sync($$$) {
+  my $self     = shift;
+  my $waiter   = shift;
+  my $advanced = shift;
+  my $log      = $self->{logger};
+  my $ret;
+  my ( $file, $pos ) = $advanced->get_binlog_position();
+  $ret = $waiter->master_pos_wait( $file, $pos );
+  if ($ret) {
+    $log->error("Get error on waiting slave");
+  }
+  return $ret;
 }
 
 1;

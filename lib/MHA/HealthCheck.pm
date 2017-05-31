@@ -77,6 +77,7 @@ sub connect {
   my $advisory_lock_timeout = shift;
   my $log_connect_error     = shift;
   my $raise_error           = shift;
+  my $no_advisory_lock      = shift;
   if ( !defined($connect_timeout) ) {
     $connect_timeout = $self->{interval};
   }
@@ -94,7 +95,7 @@ sub connect {
   }
   my $log = $self->{logger};
   $self->{dbh} = DBI->connect(
-    "DBI:mysql:;host=$self->{ip};"
+    "DBI:mysql:;host=[$self->{ip}];"
       . "port=$self->{port};mysql_connect_timeout=$connect_timeout",
     $self->{user},
     $self->{password},
@@ -104,10 +105,27 @@ sub connect {
     $log->debug("Connected on master.");
     $self->{dbh}->{InactiveDestroy} = 1;
     $self->set_wait_timeout($wait_timeout);
-    my $rc =
-      MHA::SlaveUtil::get_monitor_advisory_lock( $self->{dbh},
-      $advisory_lock_timeout );
+    my $rc = 0;
+    unless ($no_advisory_lock) {
+      $log->debug("Trying to get advisory lock..");
+      $rc = MHA::SlaveUtil::get_monitor_advisory_lock( $self->{dbh},
+        $advisory_lock_timeout );
+    }
     if ( $rc == 0 ) {
+      if ( $self->{ping_type} eq $MHA::ManagerConst::PING_TYPE_INSERT ) {
+        my $child_exit_code;
+        eval {
+          $child_exit_code = $self->fork_exec( sub { $self->ping_insert() },
+            "MySQL Ping($self->{ping_type})" );
+        };
+        if ($@) {
+          my $msg = "Unexpected error heppened when pinging! $@";
+          $log->error($msg);
+          undef $@;
+          $child_exit_code = 1;
+        }
+        return $child_exit_code;
+      }
       return 0;
     }
     elsif ( $rc == 1 ) {
@@ -269,6 +287,32 @@ sub ping_select($) {
   return 0;
 }
 
+sub ping_insert($) {
+  my $self = shift;
+  my $log  = $self->{logger};
+  my $dbh  = $self->{dbh};
+  my ( $query, $sth, $href );
+  eval {
+    $dbh->{RaiseError} = 1;
+    $dbh->do("CREATE DATABASE IF NOT EXISTS infra");
+    $dbh->do(
+"CREATE TABLE IF NOT EXISTS infra.chk_masterha (`key` tinyint NOT NULL primary key,`val` int(10) unsigned NOT NULL DEFAULT '0')"
+    );
+    $dbh->do(
+"INSERT INTO infra.chk_masterha values (1,unix_timestamp()) ON DUPLICATE KEY UPDATE val=unix_timestamp()"
+    );
+  };
+  if ($@) {
+    my $msg = "Got error on MySQL insert ping: ";
+    undef $@;
+    $msg .= $DBI::err if ($DBI::err);
+    $msg .= " ($DBI::errstr)" if ($DBI::errstr);
+    $log->warning($msg) if ($log);
+    return 1;
+  }
+  return 0;
+}
+
 sub ssh_check_simple {
   my $ssh_user            = shift;
   my $ssh_host            = shift;
@@ -338,11 +382,14 @@ sub secondary_check($) {
     . " --user=$self->{ssh_user} "
     . " --master_host=$self->{hostname} "
     . " --master_ip=$self->{ip} "
-    . " --master_port=$self->{port}";
+    . " --master_port=$self->{port}"
+    . " --master_user=$self->{user}"
+    . " --master_password=$self->{password}"
+    . " --ping_type=$self->{ping_type}";
   if ($MHA::ManagerConst::USE_SSH_OPTIONS) {
     $command .= " --options='$MHA::ManagerConst::SSH_OPT_CHECK' ";
   }
-  $log->info("Executing seconary network check script: $command");
+  $log->info("Executing secondary network check script: $command");
   my ( $high, $low ) =
     MHA::ManagerUtil::exec_system( $command, $self->{logfile} );
   if ( $high == 0 && $low == 0 ) {
@@ -352,7 +399,7 @@ sub secondary_check($) {
   }
   if ( $high == 2 ) {
     $log->warning( "At least one of monitoring servers is not reachable "
-        . "from this script. This is likely network problem. Failover should "
+        . "from this script. This is likely a network problem. Failover should "
         . "not happen." );
     return $high;
   }
@@ -385,8 +432,8 @@ sub terminate_child {
     };
     alarm $num_secs_to_timeout;
     waitpid( $pid, 0 );
-    alarm 0;
     $child_exit_code = $? >> 8;
+    alarm 0;
   };
   alarm 0;
   if ($@) {
@@ -412,7 +459,7 @@ sub invoke_sec_check {
     }
     else {
       croak
-        "Forking secondary check process failed. Can't contine operation.\n";
+        "Forking secondary check process failed. Can't continue operation.\n";
     }
   }
 }
@@ -564,6 +611,23 @@ sub handle_failing {
   $self->invoke_ssh_check();
 }
 
+sub fork_exec($$$) {
+  my $self = shift;
+  my $func = shift;
+  my $type = shift;
+
+  if ( my $pid = fork ) {
+    return $self->terminate_child( $pid, $type );
+  }
+  elsif ( defined $pid ) {
+    $SIG{INT} = $SIG{HUP} = $SIG{QUIT} = $SIG{TERM} = "DEFAULT";
+    exit $func->();
+  }
+  else {
+    croak "fork failed!\n";
+  }
+}
+
 # main function
 sub wait_until_unreachable($) {
   my $self           = shift;
@@ -576,7 +640,8 @@ sub wait_until_unreachable($) {
     while (1) {
       $self->{_tstart} = [gettimeofday];
       if ( $self->{_need_reconnect} ) {
-        my ( $rc, $mysql_err ) = $self->connect();
+        my ( $rc, $mysql_err ) =
+          $self->connect( undef, undef, undef, undef, undef, $error_count );
         if ($rc) {
           if ($mysql_err) {
             if (
@@ -584,7 +649,7 @@ sub wait_until_unreachable($) {
               > 0 )
             {
               $log->info(
-"Got MySQL error $mysql_err, but this is not mysql crash. Continue health check.."
+"Got MySQL error $mysql_err, but this is not a MySQL crash. Continue health check.."
               );
               $self->sleep_until();
               next;
@@ -594,7 +659,7 @@ sub wait_until_unreachable($) {
           $log->warning("Connection failed $error_count time(s)..");
           $self->handle_failing();
 
-          if ( $error_count >= 3 ) {
+          if ( $error_count >= 4 ) {
             $ssh_reachable = $self->is_ssh_reachable();
             $master_is_down = 1 if ( $self->is_secondary_down() );
             last if ($master_is_down);
@@ -613,65 +678,61 @@ sub wait_until_unreachable($) {
       $self->disconnect_if()
         if ( $self->{ping_type} eq $MHA::ManagerConst::PING_TYPE_CONNECT );
 
-      if ( my $pid = fork ) {
+      # Parent process forks one child process. The child process queries
+      # from MySQL every <interval> seconds. The child process may hang on
+      # executing queries.
+      # DBD::mysql 4.022 or earlier does not have an option to set
+      # read timeout, executing queries might take forever. To avoid this,
+      # the parent process kills the child process if it won't exit within
+      # <interval> seconds.
 
-        # Parent process forks one child process. The child process queries
-        # from MySQL every <interval> seconds. The child process may hang on
-        # executing queries.
-        # Since current DBD::mysql does not have an option to set
-        # read timeout, executing queries might take forever. To avoid this,
-        # the parent process kills the child process if it won't exit within
-        # <interval> seconds.
-
-        my $child_exit_code = $self->terminate_child( $pid, "MySQL Ping" );
-        if ( $child_exit_code == 0 ) {
-
-          #ping ok
-          $self->update_status_ok();
-          if ( $error_count > 0 ) {
-            $error_count = 0;
-          }
-          $self->kill_sec_check();
-          $self->kill_ssh_check();
+      my $child_exit_code;
+      eval {
+        if ( $self->{ping_type} eq $MHA::ManagerConst::PING_TYPE_CONNECT ) {
+          $child_exit_code = $self->fork_exec( sub { $self->ping_connect() },
+            "MySQL Ping($self->{ping_type})" );
         }
-        elsif ( $child_exit_code == 2 ) {
-          $self->{_already_monitored} = 1;
-          croak;
+        elsif ( $self->{ping_type} eq $MHA::ManagerConst::PING_TYPE_SELECT ) {
+          $child_exit_code = $self->fork_exec( sub { $self->ping_select() },
+            "MySQL Ping($self->{ping_type})" );
+        }
+        elsif ( $self->{ping_type} eq $MHA::ManagerConst::PING_TYPE_INSERT ) {
+          $child_exit_code = $self->fork_exec( sub { $self->ping_insert() },
+            "MySQL Ping($self->{ping_type})" );
         }
         else {
-
-          # failed on child
-          $self->{_need_reconnect} = 1;
-          $self->handle_failing();
+          die "Not supported ping_type!\n";
         }
-        $self->sleep_until();
+      };
+      if ($@) {
+        my $msg = "Unexpected error heppened when pinging! $@";
+        $log->error($msg);
+        undef $@;
+        $child_exit_code = 1;
       }
-      elsif ( defined $pid ) {
-        $SIG{INT} = $SIG{HUP} = $SIG{QUIT} = $SIG{TERM} = "DEFAULT";
 
-        # Child process
-        eval {
-          if ( $self->{ping_type} eq $MHA::ManagerConst::PING_TYPE_CONNECT ) {
-            exit $self->ping_connect();
-          }
-          elsif ( $self->{ping_type} eq $MHA::ManagerConst::PING_TYPE_SELECT ) {
-            exit $self->ping_select();
-          }
-          else {
-            die "Not supported ping_type!\n";
-          }
-          exit 0;
-        };
-        if ($@) {
-          my $msg = "Unexpected error heppened when pinging from child! $@";
-          $log->error($msg);
-          undef $@;
-          exit 1;
+      if ( $child_exit_code == 0 ) {
+
+        #ping ok
+        $self->update_status_ok();
+        if ( $error_count > 0 ) {
+          $error_count = 0;
         }
+        $self->kill_sec_check();
+        $self->kill_ssh_check();
+      }
+      elsif ( $child_exit_code == 2 ) {
+        $self->{_already_monitored} = 1;
+        croak;
       }
       else {
-        croak "fork failed!\n";
+
+        # failed on fork_exec
+        $error_count++;
+        $self->{_need_reconnect} = 1;
+        $self->handle_failing();
       }
+      $self->sleep_until();
     }
     $log->warning("Master is not reachable from health checker!");
   };

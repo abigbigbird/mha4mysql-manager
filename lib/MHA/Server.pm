@@ -160,7 +160,7 @@ sub disable_read_only($) {
 }
 
 sub connect_check {
-  my ( $self, $num_retries, $log ) = @_;
+  my ( $self, $num_retries, $log, $disconnect ) = @_;
 
   my $dbhelper = new MHA::DBHelper();
   my $dbh =
@@ -175,7 +175,7 @@ sub connect_check {
     if ( $mysql_err
       && grep ( $_ == $mysql_err, @MHA::ManagerConst::ALIVE_ERROR_CODES ) > 0 )
     {
-      $msg .= ", but this is not mysql crash. Check MySQL server settings.";
+      $msg .= ", but this is not a MySQL crash. Check MySQL server settings.";
       if ($log) {
         $log->error($msg);
         croak;
@@ -187,8 +187,13 @@ sub connect_check {
     $self->{dead} = 1;
     return $MHA::ManagerConst::MYSQL_DEAD_RC;
   }
-  $self->{dbhelper} = $dbhelper;
-  $self->{dbh}      = $dbh;
+  if ($disconnect) {
+    $dbh->disconnect();
+  }
+  else {
+    $self->{dbhelper} = $dbhelper;
+    $self->{dbh}      = $dbh;
+  }
   return 0;
 }
 
@@ -219,6 +224,7 @@ sub connect_and_get_status {
   my ( $sstatus, $mip, $mport, $read_only, $relay_purge ) = ();
   $self->{server_id}     = $dbhelper->get_server_id();
   $self->{mysql_version} = $dbhelper->get_version();
+  $self->{has_gtid}      = $dbhelper->has_gtid();
   $self->{log_bin}       = $dbhelper->is_binlog_enabled();
 
   #if log-bin is enabled, check binlog filtering rules on all servers
@@ -230,36 +236,18 @@ sub connect_and_get_status {
     $self->{Binlog_Ignore_DB} = $binlog_ignore_db;
   }
 
-  $self->{relay_log_info_type} =
-    $dbhelper->get_relay_log_info_type( $self->{mysql_version} );
-  if ( $self->{relay_log_info_type} eq "TABLE" ) {
-    my ( $relay_dir, $current_relay_log ) =
-      MHA::SlaveUtil::get_relay_dir_file_from_table($dbh);
-    $self->{relay_dir}         = $relay_dir;
-    $self->{current_relay_log} = $current_relay_log;
-    if ( !$relay_dir || !$current_relay_log ) {
-      $log->error(
-        sprintf(
-" Getting relay log directory or current relay logfile from replication table failed on %s!",
-          $self->get_hostinfo() )
-      );
-      croak;
-    }
-  }
-  else {
-    my $relay_log_info =
-      $dbhelper->get_relay_log_info_path( $self->{mysql_version} );
-    $self->{relay_log_info} = $relay_log_info;
+  $self->{datadir} = $dbhelper->get_datadir();
 
-    unless ($relay_log_info) {
-      $log->error(
-        sprintf( " Getting relay_log_info failed on %s!",
-          $self->get_hostinfo() )
-      );
-      croak;
-    }
-    $self->{datadir} = $dbhelper->get_datadir();
+  $self->{num_slave_workers} = $dbhelper->get_num_workers();
+  unless ( defined( $self->{num_slave_workers} ) ) {
+    $self->{num_slave_workers} = 0;
   }
+  $log->debug(
+    sprintf(
+      " Number of slave worker threads on host %s: %d\n",
+      $self->get_hostinfo(), $self->{num_slave_workers}
+    )
+  );
 
   my %status = $dbhelper->check_slave_status();
   $read_only   = $dbhelper->is_read_only();
@@ -280,11 +268,7 @@ sub connect_and_get_status {
   else {
     $self->{read_only}   = $read_only;
     $self->{relay_purge} = $relay_purge;
-    my $master_bin_addr = gethostbyname( $status{Master_Host} );
-    my $master_ip;
-    if ($master_bin_addr) {
-      $master_ip = sprintf( "%vd", $master_bin_addr );
-    }
+    my $master_ip = MHA::NodeUtil::get_ip( $status{Master_Host} );
     unless ($master_ip) {
       $log->error(
         sprintf(
@@ -294,11 +278,13 @@ sub connect_and_get_status {
       );
       croak;
     }
-    $self->{Master_IP}   = $master_ip;
-    $self->{Master_Port} = $status{Master_Port};
-    $self->{not_slave}   = 0;
-    $self->{Master_Host} = $status{Master_Host};
-    $self->{repl_user}   = $status{Master_User} unless ( $self->{repl_user} );
+    $self->{Master_IP}     = $master_ip;
+    $self->{Master_Port}   = $status{Master_Port};
+    $self->{not_slave}     = 0;
+    $self->{Master_Host}   = $status{Master_Host};
+    $self->{repl_user}     = $status{Master_User} unless ( $self->{repl_user} );
+    $self->{Auto_Position} = $status{Auto_Position};
+    $self->{Executed_Gtid_Set} = $status{Executed_Gtid_Set};
 
 # Master_Host is ip address when you use ip address to connect. In this case, you should use ip address to change master.
     if ( $self->{Master_Host} eq $self->{Master_IP} ) {
@@ -310,6 +296,36 @@ sub connect_and_get_status {
     $self->{Replicate_Ignore_Table}      = $status{Replicate_Ignore_Table};
     $self->{Replicate_Wild_Do_Table}     = $status{Replicate_Wild_Do_Table};
     $self->{Replicate_Wild_Ignore_Table} = $status{Replicate_Wild_Ignore_Table};
+
+    $self->{relay_log_info_type} =
+      $dbhelper->get_relay_log_info_type( $self->{mysql_version} );
+    if ( $self->{relay_log_info_type} eq "TABLE" ) {
+      my ( $relay_dir, $current_relay_log ) =
+        MHA::SlaveUtil::get_relay_dir_file_from_table($dbh);
+      $self->{relay_dir}         = $relay_dir;
+      $self->{current_relay_log} = $current_relay_log;
+      if ( !$relay_dir || !$current_relay_log ) {
+        $log->error(
+          sprintf(
+" Getting relay log directory or current relay logfile from replication table failed on %s!",
+            $self->get_hostinfo() )
+        );
+        croak;
+      }
+    }
+    else {
+      my $relay_log_info =
+        $dbhelper->get_relay_log_info_path( $self->{mysql_version} );
+      $self->{relay_log_info} = $relay_log_info;
+
+      unless ($relay_log_info) {
+        $log->error(
+          sprintf( " Getting relay_log_info failed on %s!",
+            $self->get_hostinfo() )
+        );
+        croak;
+      }
+    }
   }
   return $self;
 }
@@ -452,6 +468,8 @@ sub current_slave_position {
   $self->{Exec_Master_Log_Pos}   = $status{Exec_Master_Log_Pos};
   $self->{Relay_Log_File}        = $status{Relay_Log_File};
   $self->{Relay_Log_Pos}         = $status{Relay_Log_Pos};
+  $self->{Retrieved_Gtid_Set}    = $status{Retrieved_Gtid_Set};
+  $self->{Executed_Gtid_Set}     = $status{Executed_Gtid_Set};
   return $self;
 }
 
@@ -521,7 +539,25 @@ sub wait_until_relay_log_applied {
   my $log  = shift;
   $log = $self->{logger} unless ($log);
   my $dbhelper = $self->{dbhelper};
-  my %status   = $dbhelper->wait_until_relay_log_applied();
+  my %status =
+    $dbhelper->wait_until_relay_log_applied( $log, $self->{num_slave_workers} );
+  if ( $status{Status} ) {
+    my $msg =
+      sprintf( "Checking slave status failed on %s.", $self->get_hostinfo() );
+    $msg .= " err=$status{Errstr}" if ( $status{Errstr} );
+    $log->error($msg);
+  }
+  return $status{Status};
+}
+
+sub wait_until_relay_io_log_applied {
+  my $self = shift;
+  my $log  = shift;
+  $log = $self->{logger} unless ($log);
+  my $dbhelper = $self->{dbhelper};
+  my %status =
+    $dbhelper->wait_until_relay_io_log_applied( $log,
+    $self->{num_slave_workers} );
   if ( $status{Status} ) {
     my $msg =
       sprintf( "Checking slave status failed on %s.", $self->get_hostinfo() );
@@ -646,10 +682,10 @@ sub unlock_tables($) {
 sub reset_slave_all {
   my $self     = shift;
   my $dbhelper = $self->{dbhelper};
-  $dbhelper->reset_slave_master_host();
   if ( !$self->version_ge("5.5.0") ) {
     $dbhelper->reset_slave_by_change_master();
   }
+  $dbhelper->reset_slave_master_host();
 }
 
 # Let the server to return nothing at SHOW SLAVE STATUS (Without this, the new master still points to the previous master)
@@ -705,14 +741,23 @@ sub wait_until_slave_starts($$) {
   my $log         = $self->{logger};
   my $dbhelper    = $self->{dbhelper};
   my $retry_count = 100;
+  my $interval    = 0.1;
+  if ( $self->{has_gtid} ) {
+    $interval    = 1;
+    $retry_count = 600;
+  }
   for ( my $i = 0 ; $i < $retry_count ; $i++ ) {
     my %status = $dbhelper->check_slave_status();
     if ( $status{Status} ) {
-      my $msg =
-        sprintf( "Checking slave status failed on %s.", $self->get_hostinfo() );
-      $msg .= " err=$status{Errstr}" if ( $status{Errstr} );
-      $log->error($msg);
-      return 1;
+
+      # on GTID mode, it may take time to have Master_Log_File
+      if ( !$self->{has_gtid} || ( $self->{has_gtid} && $status{Errstr} ) ) {
+        my $msg = sprintf( "Checking slave status failed on %s.",
+          $self->get_hostinfo() );
+        $msg .= " err=$status{Errstr}" if ( $status{Errstr} );
+        $log->error($msg);
+        return 1;
+      }
     }
     if ( $type eq "IO" ) {
       return 0 if ( $status{Slave_IO_Running} eq "Yes" );
@@ -739,7 +784,7 @@ sub wait_until_slave_starts($$) {
       );
       return 1;
     }
-    sleep(0.1);
+    sleep($interval);
   }
   $log->error(
     sprintf( "Slave could not be started on %s! Check slave status.",
@@ -755,6 +800,11 @@ sub wait_until_slave_stops {
   $log = $self->{logger} unless ($log);
   my $dbhelper    = $self->{dbhelper};
   my $retry_count = 100;
+  my $interval    = 0.1;
+  if ( $self->{has_gtid} ) {
+    $interval    = 1;
+    $retry_count = 600;
+  }
   for ( my $i = 0 ; $i < $retry_count ; $i++ ) {
     my %status = $dbhelper->check_slave_status();
     if ( $status{Status} ) {
@@ -775,7 +825,7 @@ sub wait_until_slave_stops {
         if ( $status{Slave_IO_Running} eq "No"
         && $status{Slave_SQL_Running} eq "No" );
     }
-    sleep(0.1);
+    sleep($interval);
   }
   $log->error(
     sprintf( "Slave could not be stopped on %s! Check slave status.",
@@ -915,6 +965,40 @@ sub start_sql_thread_if {
   return 0;
 }
 
+sub gtid_wait {
+  my ( $self, $exec_gtid, $log ) = @_;
+  $log = $self->{logger} unless ($log);
+  my $dbhelper = $self->{dbhelper};
+  my $res      = $dbhelper->gtid_wait($exec_gtid);
+  if ( !defined($res) ) {
+    $log->error(
+      sprintf(
+        "gtid_wait(%s) returned NULL on %s. Maybe SQL thread was aborted?",
+        $exec_gtid, $self->get_hostinfo()
+      )
+    );
+    return 1;
+  }
+  if ( $res >= 0 ) {
+    $log->info(
+      sprintf(
+        " gtid_wait(%s) completed on %s. Executed %d events.",
+        $exec_gtid, $self->get_hostinfo(), $res
+      )
+    );
+    return 0;
+  }
+  else {
+    $log->error(
+      sprintf(
+        "gtid_wait(%s) got error on %s: $res",
+        $exec_gtid, $self->get_hostinfo()
+      )
+    );
+    return 1;
+  }
+}
+
 sub master_pos_wait_internal {
   my ( $self, $binlog_file, $binlog_pos, $log ) = @_;
   $log = $self->{logger} unless ($log);
@@ -991,6 +1075,9 @@ sub print_server {
   }
   $log->info(
     "  " . $self->get_hostinfo() . $ssh_str . $version_str . $binlog_str );
+  if ( $self->{has_gtid} ) {
+    $log->info("    GTID ON");
+  }
   $log->debug("   Relay log info repository: $self->{relay_log_info_type}")
     if ( $self->{relay_log_info_type} );
   if ( $self->{Master_IP} && $self->{Master_Port} ) {

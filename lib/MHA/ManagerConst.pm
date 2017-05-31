@@ -24,7 +24,7 @@ use warnings FATAL => 'all';
 
 use MHA::NodeConst;
 
-our $VERSION          = '0.56';
+our $VERSION          = '0.57';
 our $NODE_MIN_VERSION = '0.54';
 
 our @ALIVE_ERROR_CODES = (
@@ -50,7 +50,6 @@ our $MYSQL_DEAD_RC  = 10;
 our $ST_RUNNING              = 0;
 our $ST_NOT_RUNNING          = 2;
 our $ST_PARTIALLY_RUNNING    = 3;
-our $ST_NOT_FOUND            = 4;
 our $ST_INITIALIZING_MONITOR = 10;
 our $ST_PING_FAILING         = 20;
 our $ST_PING_FAILED          = 21;
@@ -63,7 +62,6 @@ our $ST_FAILOVER_ERROR       = 51;
 our $ST_RUNNING_S           = "$ST_RUNNING:PING_OK";
 our $ST_NOT_RUNNING_S       = "$ST_NOT_RUNNING:NOT_RUNNING";
 our $ST_PARTIALLY_RUNNING_S = "$ST_PARTIALLY_RUNNING:PARTIALLY_RUNNING";
-our $ST_NOT_FOUND_S         = "$ST_NOT_FOUND:NOT_FOUND";
 our $ST_INITIALIZING_MONITOR_S =
   "$ST_INITIALIZING_MONITOR:INITIALIZING_MONITOR";
 our $ST_PING_FAILING_S     = "$ST_PING_FAILING:PING_FAILING";
@@ -83,6 +81,7 @@ our $SSH_OPT_CHECK_DEFAULT = $SSH_OPT_CHECK;
 
 our $PING_TYPE_CONNECT = "CONNECT";
 our $PING_TYPE_SELECT  = "SELECT";
+our $PING_TYPE_INSERT  = "INSERT";
 
 our $DEFAULT_GLOBAL_CONF = "/etc/masterha_default.cnf";
 

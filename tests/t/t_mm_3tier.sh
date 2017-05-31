@@ -1,13 +1,20 @@
 . ./init.sh
 
-mysql $M -e "change master to master_host='127.0.0.1', master_port=$S1P, master_user='rsandbox', master_password='rsandbox', master_log_file='mysql-bin.000001', master_log_pos=4; start slave"
+POS1=`get_binlog_position $S1P`
+mysql $M -e "change master to master_host='127.0.0.1', master_port=$S1P, master_user='rsandbox', master_password='rsandbox', master_log_file='mysql-bin.000001', master_log_pos=$POS1; start slave"
 
 mysql $M test -e "insert into t1 values(2, 200, 'aaaaaa')"
 sleep 1
 mysql $S1 -e "set global read_only=1"
-
+POS2=`get_binlog_position $S1P`
 mysql $S2 -e "stop slave"
-mysql $S2 -e "change master to master_host='127.0.0.1', master_port=$S1P, master_user='rsandbox', master_password='rsandbox', master_log_file='mysql-bin.000001', master_log_pos=4"
+is_gtid_supported
+if test $? = 1
+then
+mysql $S2 -e "change master to master_host='127.0.0.1', master_port=$S1P, master_user='rsandbox', master_password='rsandbox'"
+else
+mysql $S2 -e "change master to master_host='127.0.0.1', master_port=$S1P, master_user='rsandbox', master_password='rsandbox', master_log_file='mysql-bin.000001', master_log_pos=$POS2"
+fi
 mysql $S2 -e "start slave"
 
 check_master $0 $S2P $S1P

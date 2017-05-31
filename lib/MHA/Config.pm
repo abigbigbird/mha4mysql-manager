@@ -31,7 +31,7 @@ use MHA::NodeUtil;
 use MHA::ManagerConst;
 
 my @PARAM_ARRAY =
-  qw/ hostname ip port ssh_host ssh_ip ssh_port ssh_connection_timeout ssh_options node_label candidate_master no_master ignore_fail skip_init_ssh_check skip_reset_slave user password repl_user repl_password disable_log_bin master_pid_file handle_raw_binlog ssh_user remote_workdir master_binlog_dir log_level manager_workdir manager_log check_repl_delay check_repl_filter latest_priority multi_tier_slave ping_interval ping_type secondary_check_script master_ip_failover_script master_ip_online_change_script shutdown_script report_script init_conf_load_script client_bindir client_libdir/;
+  qw/ hostname ip port ssh_host ssh_ip ssh_port ssh_connection_timeout ssh_options node_label candidate_master no_master ignore_fail skip_init_ssh_check skip_reset_slave user password repl_user repl_password disable_log_bin master_pid_file handle_raw_binlog ssh_user remote_workdir master_binlog_dir log_level manager_workdir manager_log check_repl_delay check_repl_filter latest_priority multi_tier_slave ping_interval ping_type secondary_check_script master_ip_failover_script master_ip_online_change_script shutdown_script report_script init_conf_load_script client_bindir client_libdir use_gtid_auto_pos/;
 my %PARAM;
 for (@PARAM_ARRAY) { $PARAM{$_} = 1; }
 
@@ -213,6 +213,12 @@ sub parse_server {
     $value{skip_reset_slave} = 0 if ( !defined( $value{skip_reset_slave} ) );
   }
 
+  $value{use_gtid_auto_pos} = $param_arg->{use_gtid_auto_pos};
+  if ( !defined( $value{use_gtid_auto_pos} ) ) {
+    $value{use_gtid_auto_pos} = $default->{use_gtid_auto_pos};
+    $value{use_gtid_auto_pos} = 1 if ( !defined( $value{use_gtid_auto_pos} ) );
+  }
+
   $value{master_binlog_dir} = $param_arg->{master_binlog_dir};
   if ( !defined( $value{master_binlog_dir} ) ) {
     $value{master_binlog_dir} = $default->{master_binlog_dir};
@@ -265,9 +271,10 @@ sub parse_server {
   }
   $value{ping_type} = uc( $value{ping_type} );
   croak
-"Parameter ping_type must be either '$MHA::ManagerConst::PING_TYPE_CONNECT' or '$MHA::ManagerConst::PING_TYPE_SELECT'. Current value: $value{ping_type}\n"
+"Parameter ping_type must be either '$MHA::ManagerConst::PING_TYPE_CONNECT' or '$MHA::ManagerConst::PING_TYPE_SELECT' or '$MHA::ManagerConst::PING_TYPE_INSERT'. Current value: $value{ping_type}\n"
     if ( $value{ping_type} ne $MHA::ManagerConst::PING_TYPE_CONNECT
-    && $value{ping_type} ne $MHA::ManagerConst::PING_TYPE_SELECT );
+    && $value{ping_type} ne $MHA::ManagerConst::PING_TYPE_SELECT
+    && $value{ping_type} ne $MHA::ManagerConst::PING_TYPE_INSERT );
 
   $value{ping_interval} = $param_arg->{ping_interval};
   if ( !defined( $value{ping_interval} ) ) {
@@ -295,12 +302,15 @@ sub parse_server {
 
   # set escaped_user and escaped_password
   foreach my $key ( 'user', 'password' ) {
-    my $new_key = "escaped_" . $key;
+    my $new_key       = "escaped_" . $key;
+    my $new_mysql_key = "mysql_escaped_" . $key;
     if ( $server->{$key} ) {
       $server->{$new_key} = MHA::NodeUtil::escape_for_shell( $server->{$key} );
+      $server->{$new_mysql_key} =
+        MHA::NodeUtil::escape_for_mysql_command( $server->{$key} );
     }
     else {
-      $server->{$new_key} = "";
+      $server->{$new_key} = $server->{$new_mysql_key} = "";
     }
   }
   return $server;
@@ -320,6 +330,7 @@ sub read_config($) {
   my $self              = shift;
   my $log               = $self->{logger};
   my @servers           = ();
+  my @binlog_servers    = ();
   my $global_configfile = $self->{globalfile};
   my $configfile        = $self->{file};
   my $sd;
@@ -328,7 +339,7 @@ sub read_config($) {
     my $global_cfg = Config::Tiny->read($global_configfile)
       or croak "$global_configfile:$!\n";
 
-    $log->info("Reading default configuratoins from $self->{globalfile}..")
+    $log->info("Reading default configuration from $self->{globalfile}..")
       if ($log);
     $sd = $self->parse_server_default( $global_cfg->{"server default"} );
   }
@@ -340,14 +351,14 @@ sub read_config($) {
   }
 
   my $cfg = Config::Tiny->read($configfile) or croak "$configfile:$!\n";
-  $log->info("Reading application default configurations from $self->{file}..")
+  $log->info("Reading application default configuration from $self->{file}..")
     if ($log);
 
   # Read application default settings
   $sd = $self->parse_server( $cfg->{"server default"}, $sd );
 
   if ( defined( $sd->{init_conf_load_script} ) ) {
-    $log->info( "Updating application default configurations from "
+    $log->info( "Updating application default configuration from "
         . $sd->{init_conf_load_script}
         . ".." )
       if ($log);
@@ -361,12 +372,12 @@ sub read_config($) {
     $sd = $self->parse_server( $param, $sd );
   }
 
-  $log->info("Reading server configurations from $self->{file}..") if ($log);
+  $log->info("Reading server configuration from $self->{file}..") if ($log);
 
   my @blocks = sort keys(%$cfg);
   foreach my $block (@blocks) {
     next if ( $block eq "server default" );
-    if ( $block !~ /^server\S+/ ) {
+    if ( $block !~ /^server\S+/ && $block !~ /^binlog\S+/ ) {
       my $msg =
 "Block name \"$block\" is invalid. Block name must be \"server default\" or start from \"server\"(+ non-whitespace characters).";
       $log->error($msg) if ($log);
@@ -374,7 +385,12 @@ sub read_config($) {
     }
     my $server = $self->parse_server( $cfg->{$block}, $sd );
     $server->{id} = $block;
-    push( @servers, $server );
+    if ( $block =~ /^server\S+/ ) {
+      push( @servers, $server );
+    }
+    elsif ( $block =~ /^binlog\S+/ ) {
+      push( @binlog_servers, $server );
+    }
   }
   my @tmp;
   foreach (@servers) {
@@ -387,7 +403,7 @@ sub read_config($) {
   }
   unless (@servers) {
     my $msg =
-"No server is defined in the configuration file. Check configurations for details";
+"No server is defined in configurations file. Check configurations for details";
     $log->error($msg) if ($log);
     croak($msg);
   }
@@ -422,7 +438,7 @@ sub read_config($) {
     }
   }
 
-  return @servers;
+  return ( \@servers, \@binlog_servers );
 }
 
 sub parse_server_default {

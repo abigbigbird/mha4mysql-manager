@@ -4,11 +4,11 @@ if [ "A$VERSION" = "A" ]; then
   export VERSION=5.5.16
 fi
 
-if [ "A$VERSION_DIR" = "A" ]; then
-  export VERSION_DIR=5_5_16
-fi
+export VERSION_DIR=`echo $VERSION | perl -pi -e 's/\./\_/g'`
 
 if [ "A$USE_ROW_FORMAT" = "A" ]; then
+  #export MASTER_OPTIONS="--my_file=my.cnf"
+  #export SLAVE_OPTIONS="--my_file=my-gtid-slave.cnf"
   export NODE_OPTIONS="--my_file=my.cnf"
 else
   export NODE_OPTIONS="--my_file=my-row.cnf"
@@ -31,11 +31,13 @@ export S4P=10004
 export CONF=mha_test.cnf
 export CONF_LATEST=mha_test_latest.cnf
 export CONF_IGNORE=mha_test_ignore.cnf
+export CONF_BINLOG=mha_test_binlog.cnf
+export MASTER_DATA_DIR=$SANDBOX_HOME/rsandbox_$VERSION_DIR/master/data/
 export CLIENT_BINDIR=""
 export CLIENT_LIBDIR=""
 if [ "A$CUSTOM_CLIENTS" = "Ayes" ]; then
   export CLIENT_BINDIR="client_bindir=/opt/mysql/$VERSION/bin"
-  export CLIENT_LIBDIR="client_libdir=/opt/mysql/$VERSION/lib/mysql"
+#  export CLIENT_LIBDIR="client_libdir=/opt/mysql/$VERSION/lib/mysql"
 elif [ "A$CUSTOM_CLIENTS" = "Abad" ]; then
   export CLIENT_BINDIR="client_bindir=/opt/mysql/$VERSION"
   export CLIENT_LIBDIR="client_libdir=/opt/mysql/$VERSION"
@@ -79,6 +81,33 @@ fail_if_nonempty() {
   fi
 }
 
+skip_if_gtid() {
+GTID=`mysql -h 127.0.0.1 --port=$S3P -e "show slave status\G" | grep Auto_Position | awk {'print $2'}`
+  if [ "a$GTID" = "a1" ]; then
+    echo "$1 [Skip]"
+    exit 0
+  fi
+}
+
+skip_if_not_gtid() {
+GTID=`mysql -h 127.0.0.1 --port=$S3P -e "show slave status\G" | grep Auto_Position | awk {'print $2'}`
+  if [ "a$GTID" = "a1" ]; then
+    return 0
+  else
+    echo "$1 [Skip]"
+    exit 0
+  fi
+}
+
+
+is_gtid_supported() {
+GTID=`mysql -h 127.0.0.1 --port=$S3P -e "show slave status\G" | grep Auto_Position | awk {'print $2'}`
+  if [ "a$GTID" = "a1" ]; then
+    return 1
+  fi
+  return 0
+}
+
 is_read_only() {
 READ_ONLY=`mysql -h127.0.0.1 --port=$2 -e "select @@global.read_only\G" | grep read_only | awk '{print $2}'`
   if [ "$READ_ONLY" = "1" ]; then
@@ -117,6 +146,17 @@ MASTER_PORT=`mysql -h127.0.0.1 --port=$2 -e "show slave status\G" | grep Master_
     echo "$1 [Fail (Master Port $2 is not equal to $3)]"
     exit 1
   fi
+}
+
+get_binlog_file() {
+B_FILE=`mysql -h127.0.0.1 --port=$1 -e "show master status\G" | grep File | awk {'print $2'}`
+  echo $B_FILE
+}
+
+
+get_binlog_position() {
+POS=`mysql -h127.0.0.1 --port=$1 -e "show master status\G" | grep Position | awk {'print $2'}`
+  echo $POS
 }
 
 check_count() {
